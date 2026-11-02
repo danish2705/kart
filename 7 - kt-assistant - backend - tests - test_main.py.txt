@@ -1,0 +1,45 @@
+"""Starter tests for app/main.py (FastAPI app setup).
+
+TestClient is used WITHOUT a `with` block, so the lifespan hook
+(github_index.resume_interrupted_work) does not run during these tests.
+"""
+from fastapi.testclient import TestClient
+
+from app import llm
+from app.main import app
+
+
+def test_app_is_the_kt_assistant_api():
+    assert app.title == "KT Assistant"
+
+
+def test_cors_preflight_allows_the_frontend_origin():
+    client = TestClient(app)
+
+    response = client.options(
+        "/",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "access-control-allow-origin" in response.headers
+
+
+def test_llm_error_is_returned_as_502_with_its_message():
+    route = "/__test__/llm-error"
+
+    @app.get(route)
+    def _raise_llm_error():
+        raise llm.LLMError("model unavailable")
+
+    try:
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get(route)
+
+        assert response.status_code == 502
+        assert response.json() == {"detail": "model unavailable"}
+    finally:
+        app.router.routes[:] = [r for r in app.router.routes if getattr(r, "path", None) != route]

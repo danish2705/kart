@@ -1,0 +1,15 @@
+# Local database / scratch files (must never be committed)
+*.db
+kt_scratch.db
+
+# Test and coverage output (written by every test run)
+coverage/
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Dependencies
+node_modules/
