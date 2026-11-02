@@ -1,0 +1,508 @@
+"""Step 4 Sonar pre-check: a SonarQube Cloud scan of the agent's change BEFORE the pull request is raised.
+
+Works for every stack the pipeline builds (dev_pipe/stack.py), not only Python:
+
+  1. Scan units: one `sonar-scanner` (CLI) run over app_dir for JS/TS, Python, Java, Go, ... plus one
+     SonarScanner for .NET run (begin -> dotnet build -> end) per .NET project that contains a change
+     (the CLI scanner cannot analyse C#/VB.NET).
+  2. Each unit is uploaded as a TEMPORARY branch analysis (sonar.branch.name=devpipe-precheck/...), so the
+     main branch and PR analyses on SonarQube Cloud are never touched by unmerged code.
+  3. The pipeline waits for SonarQube Cloud to finish processing (Compute Engine task), instead of
+     polling the issue list and risking stale results.
+  4. Only issues the agent caused count: issues are kept when they sit on lines the agent added or changed
+     (`sonar.precheck.block_on: changed_lines`, default) or anywhere in a file it touched (`changed_files`).
+     Existing issues elsewhere in the repo, and issues from other repos sharing the same project key,
+     never block the PR.
+  5. Blocking = severity BLOCKER/CRITICAL/MAJOR (standard mode) or impact severity BLOCKER/HIGH/MEDIUM
+     (MQR mode); both lists are configurable.
+  6. The temporary branches are deleted afterwards (`sonar.precheck.keep_branch: true` keeps them).
+
+Failures go back to the agent through the Step 4 fix loop. Problems that the agent cannot fix (scanner
+missing, Sonar unreachable, analysis failed) are reported as `error` so the loop stops straight away.
+"""
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import requests
+
+from dev_pipe.lcov import find_lcov_reports
+from dev_pipe.sonar import coverage_exclusion_args, scanner_env, scanner_problems, scanner_tail
+from dev_pipe.stack import SKIP_DIRS, detect_projects
+
+DEFAULTS = {
+    "block_on": "changed_lines",                       # changed_lines | changed_files
+    "severities": ["BLOCKER", "CRITICAL", "MAJOR"],    # standard experience (issue.severity)
+    "impact_severities": ["BLOCKER", "HIGH", "MEDIUM"],  # MQR mode (issue.impacts[].severity)
+    "wait_seconds": 300,                               # max wait for SonarQube Cloud to process one analysis
+    "poll_seconds": 5,
+    "keep_branch": False,                              # true = keep the temporary branch analyses (debugging)
+    "branch_prefix": "devpipe-precheck",
+    "max_issues_listed": 40,                           # issues shown to the agent / in the run summary
+}
+SCAN_TIMEOUT_SECONDS = 30 * 60
+LANGUAGE_NAMES = {"py": "Python", "js": "JavaScript", "ts": "TypeScript", "css": "CSS", "web": "HTML",
+                  "docker": "Docker", "json": "JSON", "xml": "XML", "yaml": "YAML", "plsql": "SQL", "tsql": "SQL",
+                  "powershell": "PowerShell", "java": "Java", "kotlin": "Kotlin", "cs": "C#", "vbnet": "VB.NET",
+                  "go": "Go", "terraform": "Terraform", "cloudformation": "CloudFormation", "kubernetes": "Kubernetes",
+                  "shell": "Shell", "php": "PHP", "ruby": "Ruby", "scala": "Scala", "c": "C", "cpp": "C++"}
+HTTP_TIMEOUT = 30
+MAX_ISSUE_PAGES = 20                                   # 20 x 500 = SonarQube Cloud's 10,000 result cap
+DOTNET_SCANNER_DIR = Path(tempfile.gettempdir()) / "devpipe-dotnet-sonarscanner"
+JAVA_BINARY_DIRS = ("target/classes", "build/classes/java/main", "build/classes/kotlin/main", "out/production")
+
+
+# ------------------------------------------------------------------ data
+
+@dataclass
+class ScanUnit:
+    label: str           # "app (sonar-scanner)" / "src/Api (.NET)"
+    kind: str            # "cli" | "dotnet"
+    cwd: Path            # where the scanner runs (its project base dir)
+    branch: str          # temporary branch name on SonarQube Cloud
+    build_cmd: str = ""  # .NET only: the build run between begin and end
+
+
+@dataclass
+class PrecheckResult:
+    status: str                                        # passed | failed | skipped | error
+    blocking: list[dict] = field(default_factory=list)
+    ignored: int = 0                                   # issues outside the change, or below the severity bar
+    units: list[str] = field(default_factory=list)
+    message: str = ""
+    details: dict = field(default_factory=dict)   # for the step log: branches, timings, coverage, totals
+
+    @property
+    def passed(self) -> bool:
+        return self.status in ("passed", "skipped")
+
+    def label(self) -> str:
+        """One-line result for gates.json / the PR body / the ADO summary."""
+        if self.status == "failed":
+            return f"failed ({len(self.blocking)} blocking in changed code)"
+        if self.status == "error":
+            return f"error ({self.message[:120]})"
+        if self.status == "skipped":
+            return f"skipped ({self.message})"
+        return f"passed (0 blocking in changed code; {self.ignored} other issue(s) ignored)"
+
+    def report(self, limit: int = DEFAULTS["max_issues_listed"]) -> str:
+        """What the agent (fix loop) and the reviewer (run summary) see."""
+        if self.status != "failed":
+            return f"Sonar pre-check: {self.label()}"
+        lines = [f"Sonar pre-check FAILED: {len(self.blocking)} blocking issue(s) in the code you changed "
+                 f"({', '.join(self.units)}). Fix each one at its location:"]
+        for i in self.blocking[:limit]:
+            loc = f"{i['path']}:{i['line']}" if i.get("line") else i["path"]
+            lines.append(f"  [{i['severity']}] {loc} -- {i['message']} ({i['rule']})")
+        if len(self.blocking) > limit:
+            lines.append(f"  ... and {len(self.blocking) - limit} more")
+        return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ pure helpers (unit-tested)
+
+_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
+    """`git diff -U0` output -> {repo-relative path: line numbers added or changed in the NEW file}.
+    Deleted files are left out (nothing left to analyse). A new or rewritten file lists all its lines."""
+    changed: dict[str, set[int]] = {}
+    current: str | None = None
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            if target == "/dev/null":
+                current = None
+            else:
+                current = target[2:] if target.startswith("b/") else target
+                if current.startswith('"') and current.endswith('"'):
+                    current = current[1:-1]
+                changed.setdefault(current, set())
+            continue
+        if current is None:
+            continue
+        m = _HUNK.match(line)
+        if m:
+            start = int(m.group(1))
+            count = 1 if m.group(2) is None else int(m.group(2))
+            changed[current].update(range(start, start + count))
+    return changed
+
+
+def match_changed_path(component_path: str, changed: dict[str, set[int]]) -> str | None:
+    """Map a Sonar component path (relative to the scanner's base dir, which may be a sub-folder of the
+    repo) to the repo-relative path in the diff. Longest suffix match on whole path segments."""
+    comp = component_path.replace("\\", "/")
+    while comp.startswith("./"):
+        comp = comp[2:]
+    comp = comp.lstrip("/")
+    if not comp:
+        return None
+    if comp in changed:
+        return comp
+    hits = [p for p in changed if p.endswith("/" + comp) or comp.endswith("/" + p)]
+    return max(hits, key=len) if hits else None
+
+
+def issue_lines(issue: dict) -> set[int]:
+    rng = issue.get("textRange") or {}
+    start, end = rng.get("startLine"), rng.get("endLine")
+    if isinstance(start, int) and isinstance(end, int) and end >= start:
+        return set(range(start, end + 1))
+    line = issue.get("line")
+    return {line} if isinstance(line, int) else set()
+
+
+def is_blocking(issue: dict, severities: list[str], impact_severities: list[str]) -> bool:
+    """Standard experience uses issue.severity; MQR mode adds issue.impacts[].severity. Either counts."""
+    sev = {s.upper() for s in severities}
+    imp = {s.upper() for s in impact_severities}
+    if str(issue.get("severity", "")).upper() in sev:
+        return True
+    return any(str(i.get("severity", "")).upper() in imp for i in issue.get("impacts") or [])
+
+
+def classify_issues(issues: list[dict], changed: dict[str, set[int]], block_on: str,
+                    severities: list[str], impact_severities: list[str]) -> tuple[list[dict], int]:
+    """(blocking issues in the change, number of issues ignored)."""
+    blocking: list[dict] = []
+    ignored = 0
+    for issue in issues:
+        comp = str(issue.get("component", "")).split(":", 1)[-1]
+        path = match_changed_path(comp, changed)
+        if path is None or not is_blocking(issue, severities, impact_severities):
+            ignored += 1
+            continue
+        lines = issue_lines(issue)
+        if block_on == "changed_lines" and lines and not (lines & changed[path]):
+            ignored += 1
+            continue
+        # A file-level issue (no line) on a changed file counts: the change may have caused it.
+        blocking.append({
+            "path": path, "line": issue.get("line"), "rule": issue.get("rule", ""),
+            "message": issue.get("message", ""),
+            "severity": issue.get("severity") or ",".join(
+                f"{i.get('softwareQuality', '')}:{i.get('severity', '')}" for i in issue.get("impacts") or []),
+        })
+    blocking.sort(key=lambda i: (i["path"], i.get("line") or 0))
+    return blocking, ignored
+
+
+def safe_branch(prefix: str, *parts: object) -> str:
+    raw = "-".join(str(p) for p in parts if str(p))
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-")[:80] or "run"
+    return f"{prefix}/{slug}"
+
+
+def read_task_id(metadata_file: Path, fallback_dir: Path | None = None, newer_than: float = 0.0) -> str:
+    """ceTaskId from the scanner's report-task.txt. Falls back to the newest report-task.txt the scanner
+    wrote (after `newer_than`) under fallback_dir (.scannerwork/ for the CLI, .sonarqube/out/.sonar/ for .NET)."""
+    candidates = [metadata_file]
+    if fallback_dir is not None:
+        for sub in (".scannerwork", ".sonarqube"):
+            root = fallback_dir / sub
+            if root.is_dir():
+                fresh = [p for p in root.rglob("report-task.txt") if p.stat().st_mtime >= newer_than - 2]
+                candidates += sorted(fresh, key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in candidates:
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("ceTaskId="):
+                return line.split("=", 1)[1].strip()
+    return ""
+
+
+def redact(text: str, *secrets: str) -> str:
+    for s in secrets:
+        if s:
+            text = text.replace(s, "***")
+    return text
+
+
+# ------------------------------------------------------------------ scan planning
+
+def plan_units(app_dir: Path, changed_files: list[Path], branch_base: str) -> list[ScanUnit]:
+    """CLI unit for app_dir (if any change is outside a .NET project) + one .NET unit per changed .NET
+    project. Each unit gets its own temporary branch so the analyses never overwrite each other."""
+    app_dir = app_dir.resolve()
+    dotnet = [p for p in detect_projects(app_dir) if p.stack == "dotnet"]
+    changed = [c.resolve() for c in changed_files]
+
+    def inside(c: Path, root: Path) -> bool:
+        return c == root or root in c.parents
+
+    units: list[ScanUnit] = []
+    for n, proj in enumerate(dotnet, 1):
+        if any(inside(c, proj.path) for c in changed):
+            units.append(ScanUnit(f"{proj.rel(app_dir)} (.NET)", "dotnet", proj.path,
+                                  f"{branch_base}-net{n}", proj.commands[0].cmd if proj.commands else "dotnet build"))
+    outside = [c for c in changed if not any(inside(c, u.cwd) for u in units)]
+    if outside or not units:
+        units.insert(0, ScanUnit(f"{app_dir.name or '.'} (sonar-scanner)", "cli", app_dir, branch_base))
+    return units
+
+
+def coverage_reports(scan_dir: Path, newer_than: float | None) -> tuple[list[Path], list[Path], list[Path]]:
+    """(lcov, coverage.xml, jacoco) reports under scan_dir written after newer_than (None = any)."""
+    lcov = find_lcov_reports(scan_dir, newer_than=newer_than)
+    py, jacoco = [], []
+    for d, _dirs, files in _walk(scan_dir):
+        for f in files:
+            path = d / f
+            if f == "coverage.xml" or (f.startswith("jacoco") and f.endswith(".xml")):
+                if newer_than is not None and path.stat().st_mtime < newer_than - 2:
+                    continue   # stale report (e.g. committed to the repo), not from this run
+                (py if f == "coverage.xml" else jacoco).append(path)
+    return lcov, py, jacoco
+
+
+def coverage_args(scan_dir: Path, newer_than: float | None) -> list[str]:
+    """Coverage reports the build/test run just wrote, per language (reporting only; issues decide the gate)."""
+    args: list[str] = []
+    lcov, py, jacoco = coverage_reports(scan_dir, newer_than)
+    if lcov:
+        args.append("-Dsonar.javascript.lcov.reportPaths="
+                    + ",".join(Path(os.path.relpath(r, scan_dir)).as_posix() for r in lcov))
+    if py:
+        args.append("-Dsonar.python.coverage.reportPaths="
+                    + ",".join(Path(os.path.relpath(p, scan_dir)).as_posix() for p in py))
+    if jacoco:
+        args.append("-Dsonar.coverage.jacoco.xmlReportPaths="
+                    + ",".join(Path(os.path.relpath(p, scan_dir)).as_posix() for p in jacoco))
+    return args
+
+
+def java_args(scan_dir: Path) -> list[str]:
+    """sonar.java.binaries is mandatory when Java files are analysed; the build check has compiled them."""
+    has_java = False
+    binaries: list[str] = []
+    for d, dirs, files in os.walk(scan_dir):
+        rel = Path(d).relative_to(scan_dir).as_posix()
+        if any(rel == b or rel.endswith("/" + b) for b in JAVA_BINARY_DIRS):
+            binaries.append(rel)
+            dirs[:] = []
+            continue
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS or x in ("target", "build", "out")]
+        if not has_java and any(f.endswith((".java", ".kt")) for f in files):
+            has_java = True
+    if not has_java:
+        return []
+    return [f"-Dsonar.java.binaries={','.join(sorted(binaries)) or '.'}"]
+
+
+_BUILD_OUTPUT_DIRS = ("target", "build")   # JaCoCo writes target/site/jacoco/ (Maven) or build/reports/ (Gradle)
+
+
+def _walk(root: Path):
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if (x not in SKIP_DIRS or x in _BUILD_OUTPUT_DIRS)
+                   and x not in (".scannerwork", ".sonarqube")]
+        yield Path(d), dirs, files
+
+
+# ------------------------------------------------------------------ SonarQube Cloud Web API
+
+class SonarApi:
+    def __init__(self, host: str, token: str, project_key: str):
+        self.host, self.token, self.key = host.rstrip("/"), token, project_key
+
+    def _get(self, path: str, **params) -> dict:
+        resp = requests.get(f"{self.host}{path}", params=params, auth=(self.token, ""), timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+
+    def wait_for_task(self, task_id: str, wait_seconds: int, poll_seconds: int) -> tuple[str, str]:
+        """(status, error message). Status: SUCCESS | FAILED | CANCELED | TIMEOUT."""
+        deadline = time.time() + wait_seconds
+        while True:
+            task = self._get("/api/ce/task", id=task_id).get("task", {})
+            status = task.get("status", "")
+            if status in ("SUCCESS", "FAILED", "CANCELED"):
+                return status, task.get("errorMessage", "")
+            if time.time() >= deadline:
+                return "TIMEOUT", f"analysis still {status or 'pending'} after {wait_seconds}s"
+            time.sleep(poll_seconds)
+
+    def branches(self) -> list[dict]:
+        """[{name, isMain, analysisDate?, ...}] for the project."""
+        return self._get("/api/project_branches/list", project=self.key).get("branches", [])
+
+    def branch_issues(self, branch: str) -> list[dict]:
+        issues: list[dict] = []
+        for page in range(1, MAX_ISSUE_PAGES + 1):
+            data = self._get("/api/issues/search", componentKeys=self.key, branch=branch,
+                             resolved="false", ps=500, p=page)
+            batch = data.get("issues", [])
+            issues += batch
+            total = data.get("paging", {}).get("total", data.get("total", len(issues)))
+            if not batch or len(issues) >= total:
+                break
+        return issues
+
+    def delete_branch(self, branch: str) -> None:
+        try:
+            resp = requests.post(f"{self.host}/api/project_branches/delete",
+                                 params={"project": self.key, "branch": branch},
+                                 auth=(self.token, ""), timeout=HTTP_TIMEOUT)
+            print(f"[sonar-precheck] temporary branch {branch} deleted (HTTP {resp.status_code})", flush=True)
+        except requests.RequestException as err:  # cleanup must never fail the step
+            print(f"[sonar-precheck] could not delete temporary branch {branch}: {type(err).__name__}", flush=True)
+
+
+# ------------------------------------------------------------------ scanners
+
+def _run(cmd: list[str], cwd: Path, env: dict, token: str) -> subprocess.CompletedProcess:
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          env=env, timeout=SCAN_TIMEOUT_SECONDS)
+    proc.stdout, proc.stderr = redact(proc.stdout or "", token), redact(proc.stderr or "", token)
+    return proc
+
+
+def run_cli_scan(unit: ScanUnit, conn: dict, metadata: Path, extra: list[str]) -> subprocess.CompletedProcess:
+    scanner = shutil.which("sonar-scanner")
+    if not scanner:
+        raise RuntimeError("sonar-scanner CLI not found on PATH (the setup action installs it in the "
+                           "test-gates job).")
+    args = [scanner, f"-Dsonar.projectKey={conn['project_key']}", f"-Dsonar.host.url={conn['host']}",
+            "-Dsonar.sourceEncoding=UTF-8", f"-Dsonar.scanner.metadataFilePath={metadata}"]
+    if unit.branch:   # empty = analyse as the project's main branch (Step 7 baseline scan)
+        args.append(f"-Dsonar.branch.name={unit.branch}")
+    if conn.get("organization"):
+        args.append(f"-Dsonar.organization={conn['organization']}")
+    args += coverage_exclusion_args(unit.cwd)
+    # Token via the environment, never argv.
+    return _run(args + extra, unit.cwd, {**scanner_env(), "SONAR_TOKEN": conn["token"]}, conn["token"])
+
+
+def dotnet_scanner() -> str:
+    """SonarScanner for .NET, installed once per job into a temp tool path."""
+    exe = DOTNET_SCANNER_DIR / "dotnet-sonarscanner"
+    if exe.exists():
+        return str(exe)
+    if not shutil.which("dotnet"):
+        raise RuntimeError("a .NET project changed but the dotnet SDK is not on PATH.")
+    proc = subprocess.run(["dotnet", "tool", "install", "dotnet-sonarscanner", "--tool-path",
+                           str(DOTNET_SCANNER_DIR)], capture_output=True, text=True, timeout=600)
+    if proc.returncode != 0 and not exe.exists():
+        raise RuntimeError(f"could not install dotnet-sonarscanner: {(proc.stderr or proc.stdout)[-500:]}")
+    return str(exe)
+
+
+def run_dotnet_scan(unit: ScanUnit, conn: dict, metadata: Path, extra: list[str]) -> subprocess.CompletedProcess:
+    """begin -> build -> end. SonarScanner for .NET takes the token as /d:sonar.token (its documented
+    usage on CI); the captured output is redacted and GitHub masks the secret in logs."""
+    exe = dotnet_scanner()
+    env = {**scanner_env(), "SONAR_TOKEN": conn["token"]}
+    begin = [exe, "begin", f"/k:{conn['project_key']}", f"/d:sonar.host.url={conn['host']}",
+             f"/d:sonar.token={conn['token']}", f"/d:sonar.branch.name={unit.branch}",
+             f"/d:sonar.scanner.metadataFilePath={metadata}"]
+    if conn.get("organization"):
+        begin.append(f"/o:{conn['organization']}")
+    begin += ["/d:" + a[2:] for a in coverage_exclusion_args(unit.cwd) + list(extra) if a.startswith("-D")]
+    steps = [begin, ["bash", "-lc", unit.build_cmd], [exe, "end", f"/d:sonar.token={conn['token']}"]]
+    out, err = "", ""
+    for cmd in steps:
+        proc = _run(cmd, unit.cwd, env, conn["token"])
+        out, err = out + proc.stdout, err + proc.stderr
+        if proc.returncode != 0:
+            return subprocess.CompletedProcess(cmd[:2], proc.returncode, out, err)
+    return subprocess.CompletedProcess(["dotnet-sonarscanner"], 0, out, err)
+
+
+# ------------------------------------------------------------------ entry point
+
+def run_precheck(conn: dict, app_dir: Path, work_root: Path, diff_text: str, opts: dict | None = None,
+                 run_id: str = "", newer_than: float | None = None, api: SonarApi | None = None,
+                 scanners: dict | None = None) -> PrecheckResult:
+    """conn: host, token, project_key, organization. diff_text: `git diff -U0 <base>` of the change.
+    `api` / `scanners` are injectable for tests."""
+    o = {**DEFAULTS, **(opts or {})}
+    changed = parse_changed_lines(diff_text)
+    if not changed:
+        return PrecheckResult("skipped", message="no changed files to analyse")
+
+    api = api or SonarApi(conn["host"], conn["token"], conn["project_key"])
+    scanners = scanners or {"cli": run_cli_scan, "dotnet": run_dotnet_scan}
+    branch_base = safe_branch(o["branch_prefix"], run_id or int(time.time()))
+    units = plan_units(app_dir, [work_root / p for p in changed], branch_base)
+    labels = [u.label for u in units]
+    print(f"[sonar-precheck] {len(changed)} changed file(s); scan units: {labels}; block_on={o['block_on']}",
+          flush=True)
+
+    blocking: list[dict] = []
+    ignored = 0
+    scanned: list[str] = []
+    details: dict = {"changed_files": len(changed), "changed_lines": sum(len(v) for v in changed.values()),
+                     "branches": [], "processing_seconds": [], "coverage": [], "total_issues": 0,
+                     "deleted": False, "block_on": o["block_on"],
+                     "rule": "/".join(o["severities"]) + " (or impact " + "/".join(o["impact_severities"]) + ")"}
+
+    def fail(message: str) -> PrecheckResult:
+        return PrecheckResult("error", units=labels, message=message, details=details)
+    try:
+        for unit in units:
+            extra = coverage_args(unit.cwd, newer_than)
+            details["coverage"] += [a.split("=", 1)[1] for a in extra]
+            if unit.kind == "cli":
+                extra += java_args(unit.cwd)
+            started = time.time()
+            with tempfile.TemporaryDirectory(prefix="devpipe-sonar-") as tmp:
+                metadata = Path(tmp) / "report-task.txt"
+                try:
+                    scan = scanners[unit.kind](unit, conn, metadata, extra)
+                except (RuntimeError, OSError, subprocess.TimeoutExpired) as err:
+                    return fail(f"{unit.label}: {err}")
+                scanned.append(unit.branch)
+                details["branches"].append(unit.branch)
+                out_text = (scan.stdout or "") + "\n" + (scan.stderr or "")
+                m = re.search(r"(\d+) files indexed", out_text)
+                if m:
+                    details["files_indexed"] = details.get("files_indexed", 0) + int(m.group(1))
+                langs = details.setdefault("languages", [])
+                for key in re.findall(r"Quality profile for (\w+):", out_text):
+                    name = LANGUAGE_NAMES.get(key, key)
+                    if name not in langs:
+                        langs.append(name)
+                for line in scanner_problems(scan, limit=20):
+                    print(f"[sonar-precheck] {line}", flush=True)
+                if scan.returncode != 0:
+                    print(scanner_tail(scan), flush=True)
+                    return fail(f"{unit.label}: scanner exited {scan.returncode} (see the job log)")
+                task_id = read_task_id(metadata, unit.cwd, started)
+            if not task_id:
+                return fail(f"{unit.label}: no ceTaskId in the scanner output")
+            waited = time.time()
+            status, err = api.wait_for_task(task_id, int(o["wait_seconds"]), int(o["poll_seconds"]))
+            details["processing_seconds"].append(round(time.time() - waited, 1))
+            if status != "SUCCESS":
+                return fail(f"{unit.label}: analysis {status} {err}".strip())
+            branch_issues = api.branch_issues(unit.branch)
+            details["total_issues"] += len(branch_issues)
+            found, skipped = classify_issues(branch_issues, changed, o["block_on"],
+                                             o["severities"], o["impact_severities"])
+            print(f"[sonar-precheck] {unit.label}: {len(found)} blocking in changed code, {skipped} ignored",
+                  flush=True)
+            blocking += found
+            ignored += skipped
+    except requests.RequestException as err:
+        return fail(f"SonarQube Cloud API: {type(err).__name__}: {err}"[:300])
+    finally:
+        if not o["keep_branch"]:
+            for b in scanned:
+                api.delete_branch(b)
+            details["deleted"] = bool(scanned)
+
+    # The same issue can be reported by two units (e.g. a file both scanners saw); keep one.
+    unique = {(i["path"], i.get("line"), i["rule"], i["message"]): i for i in blocking}
+    blocking = sorted(unique.values(), key=lambda i: (i["path"], i.get("line") or 0))
+    return PrecheckResult("failed" if blocking else "passed", blocking, ignored, labels, details=details)

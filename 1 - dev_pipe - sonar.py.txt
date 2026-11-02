@@ -1,0 +1,191 @@
+"""Step 7: SonarQube Quality Validation on the pull request.
+
+Runs a PR analysis (sonar.pullrequest.*) and reads the gate result from the Web API.
+Needs PR analysis support: SonarCloud, or SonarQube Developer edition or higher.
+The step 4 pre-check (dev_agent/checks/sonar_precheck.py) is reused unchanged.
+"""
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import requests
+
+# Test files are not application code: keep them out of the coverage % on every project and language.
+# Without this, Sonar counts *.test.jsx, __tests__/, conftest.py ... as uncovered source lines.
+COVERAGE_EXCLUSIONS = ("**/*.test.*,**/*.spec.*,**/__tests__/**,**/__mocks__/**,**/tests/**,**/test/**,"
+                       "**/conftest.py,**/test_*.py,**/*_test.py,**/src/test/**,**/*Test.java,**/*Tests.cs")
+_REPO_SETS_EXCLUSIONS = re.compile(r"^\s*sonar\.coverage\.exclusions\s*[=:]", re.MULTILINE)
+
+
+def coverage_exclusion_args(scan_dir) -> list[str]:
+    """-Dsonar.coverage.exclusions for the scan, unless the scanned repo sets it in its own
+    sonar-project.properties (a -D value would override the repo owner's choice)."""
+    props = Path(scan_dir) / "sonar-project.properties"
+    try:
+        if props.is_file() and _REPO_SETS_EXCLUSIONS.search(props.read_text(encoding="utf-8", errors="replace")):
+            return []
+    except OSError:
+        pass
+    return [f"-Dsonar.coverage.exclusions={COVERAGE_EXCLUSIONS}"]
+
+
+def run_pr_scan(app_dir: str, project_key: str, host_url: str, token: str, organization: str,
+                pr: dict, wait_seconds: int, extra_args: list[str] | None = None) -> subprocess.CompletedProcess:
+    scanner = shutil.which("sonar-scanner") or "sonar-scanner"
+    args = [
+        scanner,
+        f"-Dsonar.projectKey={project_key}",
+        f"-Dsonar.host.url={host_url}",
+        "-Dsonar.sourceEncoding=UTF-8",
+        f"-Dsonar.pullrequest.key={pr['number']}",
+        f"-Dsonar.pullrequest.branch={pr['head']}",
+        f"-Dsonar.pullrequest.base={pr['base']}",
+        "-Dsonar.qualitygate.wait=true",
+        f"-Dsonar.qualitygate.timeout={int(wait_seconds)}",
+    ]
+    if organization:
+        args.append(f"-Dsonar.organization={organization}")
+    args += coverage_exclusion_args(app_dir)
+    args += list(extra_args or [])
+    # Token via env, not argv, so it never shows in process listings or logs.
+    return subprocess.run(args, cwd=app_dir, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
+                          env={**scanner_env(), "SONAR_TOKEN": token})
+
+
+# CI variables of the PIPELINE run (this repo), not of the PR being scanned.
+_CI_ENV_PREFIXES = ("GITHUB_", "ACTIONS_")
+_CI_ENV_NAMES = {"CI", "GITHUB_ACTIONS"}
+
+
+def scanner_env() -> dict:
+    """The environment for sonar-scanner, without GitHub Actions' own CI variables.
+
+    The scanner detects GitHub Actions from these and takes the run's context (repository,
+    commit, ref, event) as the analysis context. In the Dev Pipeline that context belongs to the
+    pipeline repo, not to the target repo's PR, and with it SonarCloud stored nothing for the PR
+    ("0 New lines of code", no measures), while the same scan from a laptop stored 249 new lines.
+    All PR / revision properties are passed explicitly instead (sonar.pullrequest.*, sonar.scm.revision)."""
+    return {k: v for k, v in os.environ.items()
+            if k not in _CI_ENV_NAMES and not k.startswith(_CI_ENV_PREFIXES)}
+
+
+def scanner_problems(scan: subprocess.CompletedProcess, limit: int = 60) -> list[str]:
+    """WARN/ERROR lines from the scanner output (e.g. which file has an encoding problem).
+    The full output is captured, so without this the reason behind a Sonar 'analysis warning'
+    never reaches the job log."""
+    out = (scan.stdout or "") + "\n" + (scan.stderr or "")
+    lines = [ln.rstrip() for ln in out.splitlines() if "WARN" in ln or "ERROR" in ln]
+    return lines[:limit]
+
+
+_SCM_MARKERS = ("SCM", "changed", "Changed", "Branch name", "pull request", "Pull request", "reference branch",
+                "Could not find ref", "shallow", "Shallow", "Base dir", "Working dir", "Project key",
+                "files indexed", "languages detected", "lcov", "LCOV", "coverage", "ANALYSIS SUCCESSFUL",
+                "Merge base", "merge base", "Git ", "git ", "repository", "Repository", "status")
+
+
+# Debug noise that would push the useful lines past the limit.
+_NOISE = ("is excluded by the scm ignore settings", "Excluding file", "/node_modules/", "/coverage/lcov-report/",
+          "Configuration: {", "FeatureFlagResponse")
+
+
+def scanner_scm_lines(scan: subprocess.CompletedProcess, changed_files: list[str] | None = None,
+                      limit: int = 200) -> list[str]:
+    """Scanner lines that explain how the PR's changed lines ("New lines of code") were found:
+    branch/PR settings, SCM detection and diff, indexed files and coverage import, plus every
+    line that mentions one of the PR's changed files. Only WARN/ERROR lines were printed before,
+    which hid why a PR could show 0 new lines."""
+    out = (scan.stdout or "") + "\n" + (scan.stderr or "")
+    all_lines = out.splitlines()
+    names = [p for p in (changed_files or []) if p.strip()]
+    lines = [ln.rstrip()[:400] for ln in all_lines
+             if not any(n in ln for n in _NOISE)
+             and (any(m in ln for m in _SCM_MARKERS) or any(p in ln for p in names))]
+    return [f"scanner output: {len(all_lines)} line(s), {len(lines)} relevant"] + lines[:limit]
+
+
+def debug_enabled() -> bool:
+    return os.environ.get("SONAR_SCANNER_DEBUG", "false").strip().lower() in ("1", "true", "yes")
+
+
+_DIAG_MARKERS = ("changed lines", "Changed lines", "changed files", "diff", "Diff", "jgit", "JGit", "Exception",
+                 "Caused by", "Failed", "failed", "Unable", "unable", "not supported", "merge base", "Merge base",
+                 "reference branch", "dirty", "blame", "Blame", "scm", "SCM")
+
+
+def scanner_diag_lines(scan: subprocess.CompletedProcess, limit: int = 120) -> list[str]:
+    """Debug mode: every scanner line about SCM, diffs, changed lines or errors (unfiltered by the PR's files)."""
+    out = (scan.stdout or "") + "\n" + (scan.stderr or "")
+    lines = [ln.rstrip()[:400] for ln in out.splitlines()
+             if any(m in ln for m in _DIAG_MARKERS) and not any(n in ln for n in _NOISE)]
+    return lines[:limit]
+
+
+def scanner_debug_args() -> list[str]:
+    """SONAR_SCANNER_DEBUG=true (repo variable) turns on the scanner's debug log, which states
+    how it decided which files and lines a PR changed. Only the SCM-related lines are printed."""
+    return ["-Dsonar.verbose=true"] if debug_enabled() else []
+
+
+def fetch_pr_measures(host_url: str, token: str, project_key: str, pr_number: int) -> dict | str:
+    """What SonarCloud stored for the PR (diagnostics only, never fails the step)."""
+    try:
+        resp = requests.get(f"{host_url.rstrip('/')}/api/measures/component",
+                            params={"component": project_key, "pullRequest": pr_number,
+                                    "metricKeys": "new_lines,new_coverage,new_lines_to_cover,ncloc"},
+                            auth=(token, ""), timeout=30)
+        resp.raise_for_status()
+        measures = resp.json().get("component", {}).get("measures", [])
+        def value(m: dict):  # PR "new_*" metrics come as periods: [{"value": ...}]
+            periods = m.get("periods") or ([m["period"]] if m.get("period") else [])
+            return m.get("value", periods[0].get("value") if periods else None)
+        return {m.get("metric"): value(m) for m in measures} or "(no measures)"
+    except Exception as err:  # noqa: BLE001 - diagnostics must not break the step
+        return f"(could not read: {type(err).__name__})"
+
+
+def scanner_tail(scan: subprocess.CompletedProcess, lines: int = 40) -> str:
+    out = ((scan.stdout or "") + "\n" + (scan.stderr or "")).strip()
+    return "\n".join(out.splitlines()[-lines:])
+
+
+def fetch_gate(host_url: str, token: str, project_key: str, pr_number: int) -> dict:
+    resp = requests.get(f"{host_url.rstrip('/')}/api/qualitygates/project_status",
+                        params={"projectKey": project_key, "pullRequest": pr_number},
+                        auth=(token, ""), timeout=30)
+    resp.raise_for_status()
+    return resp.json().get("projectStatus", {})
+
+
+def fetch_pr_issues(host_url: str, token: str, project_key: str, pr_number: int) -> list[dict]:
+    resp = requests.get(f"{host_url.rstrip('/')}/api/issues/search",
+                        params={"componentKeys": project_key, "pullRequest": pr_number,
+                                "resolved": "false", "ps": 500},
+                        auth=(token, ""), timeout=30)
+    resp.raise_for_status()
+    return resp.json().get("issues", [])
+
+
+def evaluate_gate(status: dict) -> tuple[bool, list[str]]:
+    """Pure: projectStatus JSON -> (passed, failed condition descriptions)."""
+    passed = status.get("status") == "OK"
+    failed = [
+        f"{c.get('metricKey')}: actual {c.get('actualValue')} vs threshold "
+        f"{c.get('comparator', '')} {c.get('errorThreshold')}"
+        for c in status.get("conditions", []) if c.get("status") == "ERROR"
+    ]
+    return passed, failed
+
+
+def issues_text(issues: list[dict], limit: int = 50) -> str:
+    lines = [
+        f"- [{i.get('severity', '')}] {i.get('component', '').split(':', 1)[-1]}:{i.get('line', '')} "
+        f"{i.get('message', '')} ({i.get('rule', '')})"
+        for i in issues[:limit]
+    ]
+    return "\n".join(lines) or "(no open issues returned)"

@@ -1,0 +1,12 @@
+Step 7 (SonarQube Quality Validation): the SonarQube quality gate FAILED on pull request #{{pr_number}} (attempt {{attempt}} of {{max_attempts}}).
+
+## Failed conditions
+{{conditions}}
+
+## Open issues on the PR
+{{issues}}
+
+## Story plan (for context)
+{{plan}}
+
+Fix the issues in `{{app_dir}}` without changing the story's behaviour. Add or improve tests if coverage on new code is too low: extend the test files already written for this story instead of creating new ones, keep them where the project's existing tests live, never create a second test file for the same component/module (check every folder, including `__tests__/`), and only test code this story changed. Do not add `# NOSONAR` or `# pragma: no cover`. Run `python -m pytest {{app_dir}}/{{test_dir}} -q` before you finish, and list what you fixed.

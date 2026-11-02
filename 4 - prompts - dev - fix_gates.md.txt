@@ -1,0 +1,7 @@
+The quality gates FAILED (attempt {{attempt}} of {{max_attempts}}). Fix exactly these problems, then stop:
+
+{{failures}}
+
+When a fix needs tests: edit the test files you already wrote for this story instead of creating new ones, keep tests in the same place as the project's existing tests, never create a second test file for the same component/module (check every folder, including `__tests__/`), and only test code this story changed.
+
+Do not lower thresholds, skip tests, add `# pragma: no cover`, or add `# NOSONAR`. Before you finish, build and test again: {{build_check}}

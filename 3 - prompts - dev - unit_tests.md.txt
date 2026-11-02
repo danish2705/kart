@@ -1,0 +1,18 @@
+Step 4: Build + Test + Coverage (unit tests). The developer VERIFIED the code change for this story:
+
+{{plan}}
+
+## Reviewer feedback (empty if none)
+{{feedback}}
+
+## What to do
+1. Write unit tests for the code changed in this story, following the existing test style. Rules for test files:
+   - **Scope:** only test code this story changed (the files in the plan above / `git diff`). Do not add or change tests for other components, even if you notice gaps there.
+   - **Location:** put tests where this project already keeps them for that kind of code. Look first: next to the source (`Foo.test.jsx`, `foo_test.go`), in a `__tests__/` folder, or in a separate test folder (`tests/`, `src/test/`). Match what the existing tests next to the code you changed do. Only if the project has no tests at all, use `{{app_dir}}/{{test_dir}}` for Python and the language's usual convention otherwise.
+   - **No duplicates:** before creating a test file, search the whole project for an existing test of the same unit (same name in any folder, e.g. `Foo.test.jsx` and `__tests__/Foo.test.jsx`). If one exists, add your tests to that file. Never create a second test file for the same component, hook, module or class.
+2. Target at least {{threshold}}% line coverage on package `{{app_package}}`. Use the coverage-95-gate skill's procedure (the threshold here is {{threshold}}%).
+3. Every test must assert real behaviour (test-quality-review skill). Never write a test only to execute a line.
+4. Write code that passes the Sonar rules (sonar-zero-issues skill).
+5. Build and test: {{build_check}} Make sure everything passes.
+
+Do not change application behaviour in this step unless a test reveals a real bug; if so, explain it in your final message.
